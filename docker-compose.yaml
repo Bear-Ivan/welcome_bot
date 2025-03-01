@@ -1,0 +1,17 @@
+version: '3.5'
+
+services:
+  bot:
+    container_name: welcome_bot
+    build: .
+    env_file:
+      - ./.env
+    # volumes:
+    #   - ./src:/api
+    networks:
+      - api_net
+    restart: always
+
+networks:
+  api_net:
+    name: api_net
