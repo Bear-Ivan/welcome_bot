@@ -41,12 +41,13 @@ class ControlQuestionBot:
 
     async def welcome(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         for member in update.message.new_chat_members:
-            await update.message.reply_text(
+            message = await update.message.reply_text(
                 f"Добро пожаловать, {member.first_name}! {self.control_question}"
             )
             self.waiting_users[member.id] = {
                 "time": asyncio.get_event_loop().time(),
                 "context": context,
+                "messages": [update.message.message_id, message.message_id],
             }
             # Запускаем задачу для проверки ответа
             asyncio.create_task(self.check_answer(member.id))
@@ -58,7 +59,14 @@ class ControlQuestionBot:
 
         # Если пользователь не ответил за минуту, удаляем его
         context = self.waiting_users[user_id]["context"]
+        messages = self.waiting_users[user_id]["messages"]
         await context.bot.ban_chat_member(chat_id=context._chat_id, user_id=user_id)
+        await context.bot.delete_message(
+            chat_id=context._chat_id, message_id=messages[0]
+        )  # joined the group
+        await context.bot.delete_message(
+            chat_id=context._chat_id, message_id=messages[1]
+        )  # question from bot
         del self.waiting_users[user_id]  # Удаляем пользователя из списка ожидающих
         logger.info(
             f"Пользователь {user_id} был удален из группы за отсутствие ответа."
@@ -69,15 +77,29 @@ class ControlQuestionBot:
     ) -> None:
         user_id = update.message.from_user.id
         answer = update.message.text.strip().lower()
-
         # Проверяем, есть ли пользователь в списке ожидающих
         if user_id in self.waiting_users:
+            messages = self.waiting_users[user_id]["messages"]
             if answer in self.correct_answer.split(","):
-                await update.message.reply_text("Добро пожаловать!")
+                await context.bot.delete_message(
+                    chat_id=context._chat_id, message_id=messages[1]
+                )  # question from bot
+                await context.bot.delete_message(
+                    chat_id=context._chat_id, message_id=update.message.message_id
+                )  # answer to question
             else:
                 await context.bot.ban_chat_member(
                     chat_id=update.message.chat.id, user_id=user_id
                 )
+                await context.bot.delete_message(
+                    chat_id=context._chat_id, message_id=messages[0]
+                )  # joined the group
+                await context.bot.delete_message(
+                    chat_id=context._chat_id, message_id=messages[1]
+                )  # question from bot
+                await context.bot.delete_message(
+                    chat_id=context._chat_id, message_id=update.message.message_id
+                )  # answer to question
             del self.waiting_users[user_id]
 
     def run(self):
