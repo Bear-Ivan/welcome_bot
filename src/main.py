@@ -1,113 +1,126 @@
-import os
-import logging
 import asyncio
-from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-)
+import logging
+import os
 
-# Включаем логирование
+from aiogram import Bot, Dispatcher, html, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import (
+    CommandStart,
+    IS_MEMBER,
+    IS_NOT_MEMBER,
+    ChatMemberUpdatedFilter,
+)
+from aiogram.types import Message, ChatMemberUpdated
+from aiogram.exceptions import TelegramBadRequest
+
+TOKEN = os.getenv("TOKEN")
+dp = Dispatcher()
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.CRITICAL,
+    level=logging.INFO,
 )
-logger = logging.getLogger(__name__)
+
+waiting_users = {}
+welcome_messages = {}
+control_question = os.getenv("CONTROL_QUESTION")
+correct_answer = os.getenv("CORRECT_ANSWER", "").lower()
 
 
-class ControlQuestionBot:
-    def __init__(self, token: str):
-        self.application = ApplicationBuilder().token(token).build()
-        self.waiting_users = {}
-        self.control_question = os.getenv("CONTROL_QUESTION")
-        self.correct_answer = os.getenv("CORRECT_ANSWER", "").lower()
-        # Регистрация обработчиков
-        self.register_handlers()
+async def check_answer(chat_id_user_id: str) -> None:
+    global waiting_users
+    await asyncio.sleep(int(os.getenv("EXPIRED_TIME")))
+    if chat_id_user_id not in waiting_users:
+        return  # Если пользователь уже ответил, выходим из функции
 
-    def register_handlers(self):
-        self.application.add_handler(CommandHandler("start", self.start))
-        self.application.add_handler(
-            MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, self.welcome)
-        )
-        self.application.add_handler(
-            MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_answer)
-        )
+    # Если пользователь не ответил за минуту, удаляем его
+    chat = waiting_users[chat_id_user_id]["chat"]
+    messages = waiting_users[chat_id_user_id]["messages"]
+    await chat.ban(waiting_users[chat_id_user_id]["user_id"])
+    await chat.delete_message(messages)  # question from bot
+    try:
+        global welcome_messages
+        if welcome_message := welcome_messages.get(chat_id_user_id):
+            await chat.delete_message(welcome_message)  # joined the group
+            del welcome_messages[chat_id_user_id]
+    except TelegramBadRequest:
+        pass
+    del waiting_users[chat_id_user_id]  # Удаляем пользователя из списка ожидающих
 
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        await update.message.reply_text("Бот запущен!")
 
-    async def welcome(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        for member in update.message.new_chat_members:
-            message = await update.message.reply_text(
-                f"Добро пожаловать, {member.first_name}! {self.control_question}"
-            )
-            self.waiting_users[member.id] = {
-                "time": asyncio.get_event_loop().time(),
-                "context": context,
-                "messages": [update.message.message_id, message.message_id],
-            }
-            # Запускаем задачу для проверки ответа
-            asyncio.create_task(self.check_answer(member.id))
+@dp.message(CommandStart())
+async def command_start_handler(message: Message) -> None:
+    """
+    This handler receives messages with `/start` command
+    """
+    await message.answer(f"Hello, {html.bold(message.from_user.full_name)}!")
 
-    async def check_answer(self, user_id: int) -> None:
-        await asyncio.sleep(int(os.getenv("EXPIRED_TIME")))
-        if user_id not in self.waiting_users:
-            return  # Если пользователь уже ответил, выходим из функции
 
-        # Если пользователь не ответил за минуту, удаляем его
-        context = self.waiting_users[user_id]["context"]
-        messages = self.waiting_users[user_id]["messages"]
-        await context.bot.ban_chat_member(chat_id=context._chat_id, user_id=user_id)
-        await context.bot.delete_message(
-            chat_id=context._chat_id, message_id=messages[0]
-        )  # joined the group
-        await context.bot.delete_message(
-            chat_id=context._chat_id, message_id=messages[1]
-        )  # question from bot
-        del self.waiting_users[user_id]  # Удаляем пользователя из списка ожидающих
-        logger.info(
-            f"Пользователь {user_id} был удален из группы за отсутствие ответа."
-        )
+@dp.chat_member(ChatMemberUpdatedFilter(IS_NOT_MEMBER >> IS_MEMBER))
+async def welcome(message: ChatMemberUpdated):
+    global waiting_users
+    user = message.new_chat_member.user
+    message_question = await message.answer(
+        f"""Добро пожаловать, <b>{user.first_name}!</b>
+{control_question}"""
+    )
+    waiting_users[f"{message.chat.id}_{user.id}"] = {
+        "time": asyncio.get_event_loop().time(),
+        "user_id": user.id,
+        "chat": message.chat,
+        "messages": message_question.message_id,
+    }
+    asyncio.create_task(check_answer(f"{message.chat.id}_{user.id}"))
 
-    async def receive_answer(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE
-    ) -> None:
-        user_id = update.message.from_user.id
-        answer = update.message.text.strip().lower()
-        # Проверяем, есть ли пользователь в списке ожидающих
-        if user_id in self.waiting_users:
-            messages = self.waiting_users[user_id]["messages"]
-            if answer in self.correct_answer.split(","):
-                await context.bot.delete_message(
-                    chat_id=context._chat_id, message_id=messages[1]
-                )  # question from bot
-                await context.bot.delete_message(
-                    chat_id=context._chat_id, message_id=update.message.message_id
-                )  # answer to question
-            else:
-                await context.bot.ban_chat_member(
-                    chat_id=update.message.chat.id, user_id=user_id
-                )
-                await context.bot.delete_message(
-                    chat_id=context._chat_id, message_id=messages[0]
-                )  # joined the group
-                await context.bot.delete_message(
-                    chat_id=context._chat_id, message_id=messages[1]
-                )  # question from bot
-                await context.bot.delete_message(
-                    chat_id=context._chat_id, message_id=update.message.message_id
-                )  # answer to question
-            del self.waiting_users[user_id]
 
-    def run(self):
-        self.application.run_polling()
+@dp.message(F.text.regexp(r".*"))
+async def receive_answer(message: Message) -> None:
+    global waiting_users
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    # Проверяем, есть ли пользователь в списке ожидающих
+    if f"{chat_id}_{user_id}" in waiting_users:
+        messages = waiting_users[f"{chat_id}_{user_id}"]["messages"]
+        answer = message.text.strip().lower()
+        if answer in correct_answer.split(","):
+            await message.chat.delete_message(messages)  # question from bot
+            await message.delete()  # answer to question
+        else:
+            await message.chat.ban(user_id)
+            await message.chat.delete_message(messages)  # question from bot
+            await message.delete()  # answer to question
+            try:
+                global welcome_messages
+                if welcome_message := welcome_messages.get(f"{chat_id}_{user_id}"):
+                    await message.chat.delete_message(
+                        welcome_message
+                    )  # joined the group
+                    del welcome_messages[f"{chat_id}_{user_id}"]
+            except TelegramBadRequest:
+                pass
+        del waiting_users[f"{chat_id}_{user_id}"]
+
+
+@dp.message()
+async def new_chat_member(message: Message) -> None:
+    if message.text is None:
+        global welcome_messages
+        try:
+            for user in message.new_chat_members:
+                user_id = user.id
+                message_id = message.message_id
+                chat_id = message.chat.id
+                welcome_messages[f"{chat_id}_{user_id}"] = message_id
+        except Exception:
+            pass
+
+
+async def main() -> None:
+    # Initialize Bot instance with default bot properties which will be passed to all API calls
+    bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    # And the run events dispatching
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    TOKEN = os.getenv("TOKEN")
-    if TOKEN:
-        bot = ControlQuestionBot(TOKEN)
-        bot.run()
+    asyncio.run(main())
